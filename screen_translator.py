@@ -13,6 +13,8 @@ Changes in this version
 - OCR now uses `-l <lang>` when calling Tesseract
 - Preprocessing tuned to preserve Nordic/Finnish glyph details a bit better
 - Added a clearer startup error if the requested Tesseract language data is missing
+- Added smart paragraph normalization for copied text:
+  single line breaks inside a sentence become spaces, real paragraph breaks stay as paragraphs
 
 Important
 ---------
@@ -26,6 +28,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import os
+import re
 import threading
 import time
 import traceback
@@ -793,7 +796,7 @@ class ScreenTranslatorSelectorApp:
         )
         menu.add_command(label="Select Area", command=self.start_selection)
         menu.add_command(label="Show Result Window", command=self.show_result_window)
-        menu.add_command(label="Copy Translation", command=self.copy_translation)
+        menu.add_command(label="Copy", command=self.copy_translation)
         menu.add_separator()
         menu.add_command(label="Quit", command=self.quit_app)
         menu.tk_popup(event.x_root, event.y_root)
@@ -898,7 +901,6 @@ class ScreenTranslatorSelectorApp:
         gray = ImageEnhance.Sharpness(gray).enhance(2.0)
         gray = ImageEnhance.Contrast(gray).enhance(1.35)
 
-        # Less aggressive threshold than before; preserves diacritics better
         bw = gray.point(lambda p: 255 if p > 170 else 0)
         return bw
 
@@ -946,6 +948,66 @@ class ScreenTranslatorSelectorApp:
         return "\n".join(cleaned).strip()
 
     @staticmethod
+    def normalize_for_copy(text: str) -> str:
+        """
+        Keep real paragraph breaks, but convert visual OCR line-wraps inside
+        a paragraph into normal spaces.
+
+        Rules:
+        - 2+ newlines => paragraph break
+        - 1 newline => usually space
+        - preserve line breaks for bullets / list items / headings
+        """
+        if not text.strip():
+            return ""
+
+        text = text.replace("\r\n", "\n").strip()
+
+        paragraphs = re.split(r"\n\s*\n+", text)
+        normalized_paragraphs: list[str] = []
+
+        bullet_re = re.compile(r"^\s*(?:[-*•]|[0-9]+[.)]|[A-Za-z][.)])\s+")
+        heading_re = re.compile(r"^[A-ZÅÄÖ0-9][A-ZÅÄÖ0-9\s:/&()\-]{3,}$")
+
+        for para in paragraphs:
+            lines = [ln.strip() for ln in para.split("\n") if ln.strip()]
+            if not lines:
+                continue
+
+            if len(lines) == 1:
+                normalized_paragraphs.append(lines[0])
+                continue
+
+            if all(bullet_re.match(line) for line in lines):
+                normalized_paragraphs.append("\n".join(lines))
+                continue
+
+            if len(lines) <= 3 and all(heading_re.match(line) for line in lines):
+                normalized_paragraphs.append("\n".join(lines))
+                continue
+
+            merged_parts = [lines[0]]
+            for line in lines[1:]:
+                prev = merged_parts[-1]
+
+                if bullet_re.match(line):
+                    merged_parts.append("\n" + line)
+                    continue
+
+                if prev.endswith("-") and len(prev) >= 2 and prev[-2].isalpha() and line and line[0].islower():
+                    merged_parts[-1] = prev[:-1] + line
+                    continue
+
+                merged_parts[-1] = prev + " " + line
+
+            merged = "".join(merged_parts)
+            merged = re.sub(r"[ \t]+", " ", merged)
+            merged = re.sub(r" *\n *", "\n", merged).strip()
+            normalized_paragraphs.append(merged)
+
+        return "\n\n".join(normalized_paragraphs).strip()
+
+    @staticmethod
     def _update_text_widget(widget: tk.Text, text: str) -> None:
         widget.delete("1.0", "end")
         widget.insert("1.0", text)
@@ -954,7 +1016,9 @@ class ScreenTranslatorSelectorApp:
         if not self.last_translation.strip():
             self.set_status("Nothing to copy.")
             return
-        pyperclip.copy(self.last_translation)
+
+        text_to_copy = self.normalize_for_copy(self.last_translation)
+        pyperclip.copy(text_to_copy)
         self.set_status("Translation copied to clipboard.")
 
     def quit_app(self) -> None:
