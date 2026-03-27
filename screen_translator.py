@@ -4,17 +4,21 @@ screen_translate_selector_modern.py
 
 A small pinnable always-on-top icon for screen translation.
 
-Modernized UI changes
----------------------
-- Cleaner floating launcher with a more modern glyph/icon treatment
-- Dark themed result window with card-style panels
-- Better visual hierarchy for controls, status, OCR, and translation output
+Changes in this version
+-----------------------
+- Added explicit OCR language support
+- Default OCR language is Finnish (`fin`)
+- Added CLI flag: --ocr-lang
+- Added result window field for OCR language
+- OCR now uses `-l <lang>` when calling Tesseract
+- Preprocessing tuned to preserve Nordic/Finnish glyph details a bit better
+- Added a clearer startup error if the requested Tesseract language data is missing
 
-Behavior changes
-----------------
-- No workflow changes; selection, OCR, translation, and clipboard logic remain the same
-- Multi-monitor support is preserved
-- MSS capture object is still created inside the worker thread
+Important
+---------
+To recognize Finnish characters correctly, Tesseract must have Finnish trained data installed.
+Typical path:
+C:\\Program Files\\Tesseract-OCR\\tessdata\\fin.traineddata
 """
 
 from __future__ import annotations
@@ -48,8 +52,8 @@ except Exception:
 
 DEFAULT_TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 LAUNCHER_SIZE = 76
-RESULT_W = 860
-RESULT_H = 680
+RESULT_W = 920
+RESULT_H = 720
 TRANSPARENT_COLOR = "#00ff00"
 
 SM_XVIRTUALSCREEN = 76
@@ -91,7 +95,8 @@ class AppConfig:
     target_lang: str = "en"
     tesseract_cmd: Optional[str] = None
     ocr_psm: int = 6
-    preprocess_scale: int = 2
+    preprocess_scale: int = 3
+    ocr_lang: str = "fin"
 
 
 def get_virtual_screen_geometry() -> Tuple[int, int, int, int]:
@@ -144,7 +149,8 @@ def parse_args() -> AppConfig:
     parser.add_argument("--target", default="en")
     parser.add_argument("--tesseract-cmd", default=None)
     parser.add_argument("--psm", type=int, default=6)
-    parser.add_argument("--scale", type=int, default=2)
+    parser.add_argument("--scale", type=int, default=3)
+    parser.add_argument("--ocr-lang", default="fin")
     args = parser.parse_args()
 
     return AppConfig(
@@ -152,7 +158,8 @@ def parse_args() -> AppConfig:
         target_lang=args.target,
         tesseract_cmd=args.tesseract_cmd,
         ocr_psm=max(3, min(13, args.psm)),
-        preprocess_scale=max(1, min(4, args.scale)),
+        preprocess_scale=max(1, min(5, args.scale)),
+        ocr_lang=(args.ocr_lang or "fin").strip(),
     )
 
 
@@ -208,7 +215,6 @@ class SelectionOverlay:
         self.start_x = event.x
         self.start_y = event.y
 
-        # Outer glow
         self.canvas.create_rectangle(
             event.x - 1, event.y - 1, event.x + 1, event.y + 1,
             outline="#7de7ff", width=5
@@ -273,8 +279,6 @@ class SelectionOverlay:
             return
 
         self.app.capture_and_translate_region(left, top, width, height)
-
-
 
 
 class RoundedCanvas(tk.Canvas):
@@ -421,8 +425,6 @@ class ScreenTranslatorSelectorApp:
             relief="flat",
         )
         self.style.map("Modern.TEntry", bordercolor=[("focus", Theme.ACCENT)], lightcolor=[("focus", Theme.ACCENT)])
-
-        self.style.configure("Separator.TFrame", background=Theme.BORDER)
 
     def _configure_tesseract(self) -> None:
         cmd = self.config.tesseract_cmd or os.getenv("TESSERACT_CMD") or DEFAULT_TESSERACT_CMD
@@ -636,9 +638,11 @@ class ScreenTranslatorSelectorApp:
 
         ttk.Label(left_controls, text="Source", style="FieldLabel.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(left_controls, text="Target", style="FieldLabel.TLabel").grid(row=0, column=2, sticky="w", padx=(10, 0))
+        ttk.Label(left_controls, text="OCR lang", style="FieldLabel.TLabel").grid(row=0, column=4, sticky="w", padx=(10, 0))
 
         self.source_var = tk.StringVar(value=self.config.source_lang)
         self.target_var = tk.StringVar(value=self.config.target_lang)
+        self.ocr_lang_var = tk.StringVar(value=self.config.ocr_lang)
 
         self.source_entry = ttk.Entry(left_controls, width=10, textvariable=self.source_var, style="Modern.TEntry")
         self.source_entry.grid(row=1, column=0, sticky="w", pady=(5, 0))
@@ -654,6 +658,16 @@ class ScreenTranslatorSelectorApp:
 
         self.target_entry = ttk.Entry(left_controls, width=10, textvariable=self.target_var, style="Modern.TEntry")
         self.target_entry.grid(row=1, column=2, sticky="w", padx=(10, 0), pady=(5, 0))
+
+        self.ocr_lang_entry = ttk.Entry(left_controls, width=12, textvariable=self.ocr_lang_var, style="Modern.TEntry")
+        self.ocr_lang_entry.grid(row=1, column=4, sticky="w", padx=(10, 0), pady=(5, 0))
+
+        help_label = ttk.Label(
+            left_controls,
+            text="Examples: fin, eng, fin+eng",
+            style="Hint.TLabel",
+        )
+        help_label.grid(row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
 
         actions = ttk.Frame(toolbar, style="Toolbar.TFrame")
         actions.pack(side="right")
@@ -799,10 +813,14 @@ class ScreenTranslatorSelectorApp:
         try:
             source = self.source_var.get().strip() or "auto"
             target = self.target_var.get().strip() or "en"
+            ocr_lang = self.ocr_lang_var.get().strip() or "fin"
+
             self.translator = TranslatorBackend(source, target)
             self.config.source_lang = source
             self.config.target_lang = target
-            self.set_status(f"Languages updated: {source} → {target}")
+            self.config.ocr_lang = ocr_lang
+
+            self.set_status(f"Languages updated: OCR={ocr_lang}, translate {source} → {target}")
         except Exception as e:
             self.set_status(f"Language update failed: {e}")
             messagebox.showerror("Error", str(e))
@@ -840,7 +858,7 @@ class ScreenTranslatorSelectorApp:
             self.set_status("Preprocessing image for OCR…")
             processed = self.preprocess_for_ocr(image)
 
-            self.set_status("Running OCR…")
+            self.set_status(f"Running OCR ({self.config.ocr_lang})…")
             ocr_text = self.run_ocr(processed)
             self.last_ocr_text = ocr_text
             self.result.after(0, self._update_text_widget, self.ocr_text, ocr_text)
@@ -856,6 +874,10 @@ class ScreenTranslatorSelectorApp:
             self.last_translation = translated
             self.result.after(0, self._update_text_widget, self.translation_text, translated)
             self.set_status("Done.")
+        except RuntimeError as e:
+            err = f"{type(e).__name__}: {e}"
+            self.set_status(err)
+            self.result.after(0, self._update_text_widget, self.translation_text, f"ERROR\n\n{err}")
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             self.set_status(err)
@@ -871,19 +893,44 @@ class ScreenTranslatorSelectorApp:
             image = image.resize((image.width * scale, image.height * scale), Image.Resampling.LANCZOS)
 
         gray = ImageOps.grayscale(image)
-        gray = ImageOps.autocontrast(gray)
+        gray = ImageOps.autocontrast(gray, cutoff=1)
         gray = gray.filter(ImageFilter.MedianFilter(size=3))
-        gray = ImageEnhance.Sharpness(gray).enhance(1.8)
-        gray = ImageEnhance.Contrast(gray).enhance(1.6)
-        bw = gray.point(lambda p: 255 if p > 150 else 0)
+        gray = ImageEnhance.Sharpness(gray).enhance(2.0)
+        gray = ImageEnhance.Contrast(gray).enhance(1.35)
+
+        # Less aggressive threshold than before; preserves diacritics better
+        bw = gray.point(lambda p: 255 if p > 170 else 0)
         return bw
 
     def run_ocr(self, image: Image.Image) -> str:
-        text = pytesseract.image_to_string(image, config=f"--psm {self.config.ocr_psm}")
+        ocr_lang = (self.config.ocr_lang or "fin").strip()
+
+        custom_config = f"--oem 3 --psm {self.config.ocr_psm} -l {ocr_lang}"
+        try:
+            text = pytesseract.image_to_string(image, config=custom_config)
+        except pytesseract.TesseractError as e:
+            msg = str(e)
+            if "Failed loading language" in msg or "Error opening data file" in msg:
+                raise RuntimeError(
+                    f"Tesseract language data for '{ocr_lang}' is missing. "
+                    f"Install the corresponding traineddata file (for Finnish: fin.traineddata) "
+                    f"into your Tesseract tessdata folder."
+                ) from e
+            raise
+
         return self.clean_ocr_text(text)
 
     @staticmethod
     def clean_ocr_text(text: str) -> str:
+        replacements = {
+            "a¨": "ä",
+            "A¨": "Ä",
+            "o¨": "ö",
+            "O¨": "Ö",
+        }
+        for bad, good in replacements.items():
+            text = text.replace(bad, good)
+
         lines = [line.rstrip() for line in text.replace("\r\n", "\n").split("\n")]
         cleaned = []
         prev_blank = False
